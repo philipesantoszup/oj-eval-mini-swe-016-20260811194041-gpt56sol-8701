@@ -12,7 +12,7 @@ namespace {
 constexpr std::size_t PAGE_SIZE = 8192;
 constexpr int MAX_KEYS = 111;
 constexpr const char *DB_FILE = "bpt.dat";
-constexpr char MAGIC[8] = {'B','P','T','0','1','6','\0','\0'};
+constexpr char MAGIC[8] = {'B','P','T','0','1','7','\0','\0'};
 
 #pragma pack(push, 1)
 struct Key {
@@ -36,6 +36,7 @@ struct Split {
     bool split = false;
     Key separator{};
     std::uint32_t right = 0;
+    bool inserted = false;
 };
 
 int compareKey(const Key &a, const Key &b) {
@@ -147,6 +148,11 @@ class BPlusTree {
         return lo;
     }
 
+    std::uint32_t liveCount(std::uint32_t id) {
+        Node n = readNode(id);
+        return n.leaf ? n.count : n.next;
+    }
+
     Split insertRecursive(std::uint32_t id, const Key &key) {
         Node n = readNode(id);
         if (n.leaf) {
@@ -157,7 +163,7 @@ class BPlusTree {
             ++n.count;
             if (n.count <= MAX_KEYS) {
                 writeNode(id, n);
-                return {};
+                return {false, {}, 0, true};
             }
 
             Node right;
@@ -170,12 +176,17 @@ class BPlusTree {
             std::uint32_t rightId = allocate(right);
             n.next = rightId;
             writeNode(id, n);
-            return {true, right.keys[0], rightId};
+            return {true, right.keys[0], rightId, true};
         }
 
         int branch = upperBound(n, key);
         Split childSplit = insertRecursive(n.child[branch], key);
-        if (!childSplit.split) return {};
+        if (!childSplit.inserted) return {};
+        ++n.next;
+        if (!childSplit.split) {
+            writeNode(id, n);
+            return {false, {}, 0, true};
+        }
 
         for (int i = n.count; i > branch; --i) n.keys[i] = n.keys[i - 1];
         for (int i = n.count + 1; i > branch + 1; --i) n.child[i] = n.child[i - 1];
@@ -184,7 +195,7 @@ class BPlusTree {
         ++n.count;
         if (n.count <= MAX_KEYS) {
             writeNode(id, n);
-            return {};
+            return {false, {}, 0, true};
         }
 
         Node right;
@@ -195,9 +206,49 @@ class BPlusTree {
         for (int i = 0; i < right.count; ++i) right.keys[i] = n.keys[middle + 1 + i];
         for (int i = 0; i <= right.count; ++i) right.child[i] = n.child[middle + 1 + i];
         n.count = middle;
+        n.next = 0;
+        right.next = 0;
+        for (int i = 0; i <= n.count; ++i) n.next += liveCount(n.child[i]);
+        for (int i = 0; i <= right.count; ++i) right.next += liveCount(right.child[i]);
         std::uint32_t rightId = allocate(right);
         writeNode(id, n);
-        return {true, promoted, rightId};
+        return {true, promoted, rightId, true};
+    }
+
+    bool eraseRecursive(std::uint32_t id, const Key &key) {
+        Node n = readNode(id);
+        if (n.leaf) {
+            int pos = lowerBound(n, key);
+            if (pos == n.count || compareKey(n.keys[pos], key) != 0) return false;
+            for (int i = pos + 1; i < n.count; ++i) n.keys[i - 1] = n.keys[i];
+            --n.count;
+            writeNode(id, n);
+            return true;
+        }
+        int branch = upperBound(n, key);
+        if (!eraseRecursive(n.child[branch], key)) return false;
+        --n.next;
+        writeNode(id, n);
+        return true;
+    }
+
+    void findRecursive(std::uint32_t id, const Key &low, const Key &high, bool &any) {
+        Node n = readNode(id);
+        if (n.leaf) {
+            int pos = lowerBound(n, low);
+            while (pos < n.count && compareKey(n.keys[pos], high) <= 0) {
+                if (any) std::cout << ' ';
+                std::cout << n.keys[pos].value;
+                any = true;
+                ++pos;
+            }
+            return;
+        }
+        int branch = upperBound(n, low);
+        for (int i = branch; i <= n.count; ++i) {
+            if (i > branch && compareKey(n.keys[i - 1], high) > 0) break;
+            if (liveCount(n.child[i]) != 0) findRecursive(n.child[i], low, high, any);
+        }
     }
 
     std::uint32_t findLeaf(const Key &key) {
@@ -261,43 +312,20 @@ public:
             newRoot.keys[0] = s.separator;
             newRoot.child[0] = root_;
             newRoot.child[1] = s.right;
+            newRoot.next = liveCount(root_) + liveCount(s.right);
             root_ = allocate(newRoot);
         }
     }
 
     void erase(const std::string &index, int value) {
-        Key key = makeKey(index, value);
-        std::uint32_t id = findLeaf(key);
-        Node n = readNode(id);
-        int pos = lowerBound(n, key);
-        if (pos == n.count || compareKey(n.keys[pos], key) != 0) return;
-        for (int i = pos + 1; i < n.count; ++i) n.keys[i - 1] = n.keys[i];
-        --n.count;
-        writeNode(id, n);
+        eraseRecursive(root_, makeKey(index, value));
     }
 
     void find(const std::string &index) {
         Key low = makeKey(index, INT_MIN);
-        std::uint32_t id = findLeaf(low);
+        Key high = makeKey(index, INT_MAX);
         bool any = false;
-        while (id != UINT32_MAX) {
-            Node n = readNode(id);
-            int pos = lowerBound(n, low);
-            for (int i = pos; i < n.count; ++i) {
-                int c = std::strcmp(n.keys[i].index, index.c_str());
-                if (c > 0) {
-                    if (!any) std::cout << "null";
-                    std::cout << '\n';
-                    return;
-                }
-                if (c == 0) {
-                    if (any) std::cout << ' ';
-                    std::cout << n.keys[i].value;
-                    any = true;
-                }
-            }
-            id = n.next;
-        }
+        findRecursive(root_, low, high, any);
         if (!any) std::cout << "null";
         std::cout << '\n';
     }
