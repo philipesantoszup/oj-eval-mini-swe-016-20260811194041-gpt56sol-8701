@@ -4,7 +4,9 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace {
 constexpr std::size_t PAGE_SIZE = 8192;
@@ -56,6 +58,8 @@ class BPlusTree {
     FILE *file_ = nullptr;
     std::uint32_t root_ = 0;
     std::uint32_t pages_ = 0;
+    std::vector<std::unique_ptr<Node>> cache_;
+    std::vector<unsigned char> dirty_;
 
     long offset(std::uint32_t id) const {
         return static_cast<long>((static_cast<std::uint64_t>(id) + 1) * PAGE_SIZE);
@@ -71,23 +75,35 @@ class BPlusTree {
     }
 
     Node readNode(std::uint32_t id) {
+        if (cache_[id]) return *cache_[id];
+
         unsigned char page[PAGE_SIZE]{};
         std::fseek(file_, offset(id), SEEK_SET);
         if (std::fread(page, 1, PAGE_SIZE, file_) != PAGE_SIZE) {
             std::fprintf(stderr, "database read failure\n");
             std::exit(1);
         }
-        Node n;
-        n.leaf = page[0] != 0;
-        std::memcpy(&n.count, page + 1, 2);
-        std::memcpy(&n.next, page + 3, 4);
-        std::memcpy(n.keys, page + 7, sizeof(Key) * MAX_KEYS);
-        std::memcpy(n.child, page + 7 + sizeof(Key) * MAX_KEYS,
+        auto n = std::make_unique<Node>();
+        n->leaf = page[0] != 0;
+        std::memcpy(&n->count, page + 1, 2);
+        std::memcpy(&n->next, page + 3, 4);
+        std::memcpy(n->keys, page + 7, sizeof(Key) * MAX_KEYS);
+        std::memcpy(n->child, page + 7 + sizeof(Key) * MAX_KEYS,
                     sizeof(std::uint32_t) * (MAX_KEYS + 1));
-        return n;
+        Node result = *n;
+        cache_[id] = std::move(n);
+        return result;
     }
 
     void writeNode(std::uint32_t id, const Node &n) {
+        if (!cache_[id]) cache_[id] = std::make_unique<Node>();
+        *cache_[id] = n;
+        dirty_[id] = 1;
+    }
+
+    void flushNode(std::uint32_t id) {
+        if (!dirty_[id]) return;
+        const Node &n = *cache_[id];
         unsigned char page[PAGE_SIZE]{};
         page[0] = n.leaf ? 1 : 0;
         std::memcpy(page + 1, &n.count, 2);
@@ -100,10 +116,13 @@ class BPlusTree {
             std::fprintf(stderr, "database write failure\n");
             std::exit(1);
         }
+        dirty_[id] = 0;
     }
 
     std::uint32_t allocate(const Node &n) {
         std::uint32_t id = pages_++;
+        cache_.resize(pages_);
+        dirty_.resize(pages_);
         writeNode(id, n);
         return id;
     }
@@ -203,7 +222,10 @@ public:
                 valid = pages_ > 0 && root_ < pages_;
             }
         }
-        if (!valid) {
+        if (valid) {
+            cache_.resize(pages_);
+            dirty_.resize(pages_);
+        } else {
             if (file_) std::fclose(file_);
             file_ = std::fopen(DB_FILE, "w+b");
             if (!file_) {
@@ -211,6 +233,8 @@ public:
                 std::exit(1);
             }
             pages_ = 0;
+            cache_.clear();
+            dirty_.clear();
             Node root;
             root.leaf = true;
             root_ = allocate(root);
@@ -220,6 +244,7 @@ public:
 
     ~BPlusTree() {
         if (file_) {
+            for (std::uint32_t id = 0; id < pages_; ++id) flushNode(id);
             writeHeader();
             std::fflush(file_);
             std::fclose(file_);
